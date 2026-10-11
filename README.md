@@ -170,6 +170,14 @@ sh integration/dosbox-pure/apply.sh ~/dosbox-pure
 hardware and the games: the VIP card's registers, the driver's INT 33h
 interface, the stereo layouts, and what each game does.
 
+## License
+
+GPL-2.0-or-later; see [LICENSE](LICENSE). This program is free software: you
+can redistribute it and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation, either version 2 of the
+License, or (at your option) any later version. `third_party/libretro` keeps
+its own MIT license.
+
 ## Legal
 
 No game binary, ROM, or original Forte driver is included, and none will be.
