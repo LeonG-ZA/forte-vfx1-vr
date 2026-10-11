@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VFX1 head tracking · js-dos</title>
+<!--
+  The experimental WebXR version: DOS in the headset's browser, head
+  orientation driving the game through INT 33h mouse motion, no PC required.
+
+  Pipeline, all in this page on the headset:
+    WebXR viewer pose
+      -> vfxbridge.wasm   libvfxbridge's tested head-to-mouse mapping, compiled
+                          from src/bridge/mousemap.c unchanged
+      -> js-dos           ci.sendMouseRelativeMotion, classic DOSBox backend
+      -> DOS              INT 33h motion counters the game reads
+
+  The DOS screen is drawn on a head-locked virtual display, which is what the
+  real VFX1 was: two LCDs fixed to your face, with the game turning the view.
+  The default is that head-locked display. Reprojection, which places each game
+  frame along the orientation it was rendered for so it stays put in the world
+  between frames, is available but off by default for mouse-path games: in
+  Descent the game's camera does not track the head closely enough for it to
+  help. Measured with web/vfx-diag.js, the camera starts about 85 ms after the
+  head and eases in over roughly 130 ms, turns at most about 4 degrees per burst
+  of input, and its image moves 3.3 px per head degree, so the display would
+  need to span about 97 degrees, not 45, to match. Look-back reprojection
+  therefore jittered where head-locked was smooth. See docs/FINDINGS.md.
+
+  This page is an adapter: it is the only layer that names WebXR.
+
+  URL parameters:
+    game=descent (default) | probe | sense
+                                      probe runs tests/dos/int33probe.asm instead,
+                                      sense runs tests/dos/senseprobe.asm
+    tracking=vfx1 | mouse             vfx1: the head drives an emulated VFX1 head
+                                      tracker that native titles read through the
+                                      Forte driver interface; needs the js-dos build
+                                      in emulators/ (integration/jsdos/build.sh).
+                                      Default with stereo=vfx and game=sense.
+    puck=right (default) | left | off with tracking=vfx1: that controller is the
+                                      VFX1 CyberPuck. Its tilt is the puck's pitch
+                                      and roll, measured from how you held it at the
+                                      last recentre; trigger, grip and A or X are its
+                                      three buttons. They keep their key mappings too.
+    puckmouse=on | off (default)
+                                      Forte's VRMOUSE role: the puck is also
+                                      the DOS mouse, as Forte ran Descent. Tilt forward
+                                      and back is mouse Y, tilt left and right mouse X,
+                                      at a rate that grows with tilt (12 degree dead
+                                      zone, full rate at 40); trigger, grip and
+                                      A are the left, right and middle mouse buttons
+                                      instead of keys. Select Mouse as Descent's
+                                      control method.
+    puckrate=700                      mouse counts per second at full tilt
+    pose=xr (default) | fake | none   fake: scripted head sweep, no headset needed
+    backend=dosbox (default) | dosboxX
+    cycles=N | max                    default: DOS Games Archive's Descent setting
+    sens=600                          mouse counts per radian of head rotation
+    inverty, invertpitch              flip an axis
+    dist, fov                         virtual display distance (m) and width (deg);
+                                      stereo=vfx: 3.35 and 35.5, the real VFX1;
+                                      otherwise 2.0 and 97 for Descent, 45 else;
+                                      97 matches Descent's scale, 45 was the VFX1 panel
+    filter=nearest                    sharp pixels instead of smoothed
+    reproject=off (default)           head-locked display
+    reproject=lookback                render pose = head pose `latency` ms before arrival
+    reproject=model                   render pose from a camera model: delay then easing
+    latency=N                         look-back ms for reproject=lookback;
+                                      default auto (one game frame + 8 ms)
+    camdelay=85, camtau=130           camera model delay and easing time constant (ms)
+    pose=steps, stepdeg=15            scripted yaw steps for measuring the camera (diag=1)
+    diag=1                            measure the real head-to-camera delay and
+                                      per-frame jitter from the game's pixels
+                                      (web/vfx-diag.js); results go to telemetry
+    stereo=vfx                        Descent's own VFX1 stereo mode (-vfx): the game
+                                      renders each eye into one half of a 640x480
+                                      frame, and each half goes to that eye here
+    hud=left                          with stereo=vfx: leave the HUD in the left eye
+                                      only, as Descent draws it
+    notelemetry
+-->
+<link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0d0f12; color: #e7e9ef;
+               font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { display: flex; gap: .8rem 1.2rem; align-items: center; flex-wrap: wrap;
+           padding: 8px 14px; border-bottom: 1px solid #2b2f37; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  .muted { color: #99a0b0; }
+  #stats b { color: #e7e9ef; font-weight: 600; }
+  #stats { font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-weight: 600; padding: .45rem .9rem; border-radius: 8px; border: 1px solid #3a3f49;
+           background: #e7e9ef; color: #0d0f12; cursor: pointer; }
+  button.secondary { background: transparent; color: #e7e9ef; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #dos { flex: 1; min-height: 0; }
+  #xr { display: none; }
+  #start { position: fixed; inset: 0; display: grid; place-items: center; background: rgba(13,15,18,.94); z-index: 10; }
+  #start[hidden] { display: none; }
+  #start div { max-width: 34rem; padding: 20px; }
+  #start button { font-size: 18px; padding: .8rem 1.6rem; }
+  #start ul { color: #99a0b0; padding-left: 1.2rem; }
+  #probe { font-family: ui-monospace, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>VFX1 head tracking</h1>
+  <span id="cfg" class="muted"></span>
+  <button id="enter-vr" disabled>Enter VR</button>
+  <button id="recenter" class="secondary" disabled>Recentre</button>
+  <span id="stats" class="muted">starting…</span>
+  <span id="probe"></span>
+</header>
+<div id="dos"></div>
+<canvas id="xr"></canvas>
+
+<div id="start">
+  <div>
+    <button id="go">Start</button>
+    <ul>
+      <li>Tap Start first so the browser allows sound, then <b>Enter VR</b> once DOS is running.</li>
+      <li>Mouse head tracking (tracking=mouse): in Descent set <b>Options → Controls</b> to use the mouse, or head tracking has nothing to drive.</li>
+      <li>Controllers in VR, everything on the right hand: trigger fires, pressing the stick fires secondary,
+          grip accelerates, stick up/down pitches (and moves through menus), stick left/right turns the ship,
+          A is Enter (not during native stereo flight), B is Escape. Left hand, optional: trigger fires secondary,
+          stick forward accelerates, stick back reverses, stick left/right turns, X recentres your head.
+          With native tracking the right controller is also the CyberPuck: its tilt from where you held
+          it at the last recentre, and trigger, grip and A as the puck's buttons. With puckmouse=on it is also the
+          mouse, as Forte's VRMOUSE made it: tilt to fly, trigger and grip to fire.</li>
+      <li>For puckmouse=on, in Descent: Options, Controls, set the control method to <b>Mouse</b>, then customise the mouse:
+          Pitch and Turn to none (your head does those), Throttle to mouse Y, Slide left/right or Bank to mouse X.</li>
+    </ul>
+  </div>
+</div>
+
+<script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+<script src="vfxbridge.js"></script>
+<script src="vfx-reproject.js"></script>
+<script src="vfx-diag.js"></script>
+<script src="vfx-stereo.js"></script>
+<script>
+// Wrapped in a function: js-dos declares globals of its own, including `$`.
+(() => {
+"use strict";
+
+// ================================================================ config
+
+const P = new URLSearchParams(location.search);
+const game = ["probe", "sense"].includes(P.get("game")) ? P.get("game") : "descent";
+const poseMode = ["xr", "fake", "steps", "none"].includes(P.get("pose")) ? P.get("pose") : "xr";
+// pose=steps: sharp 15 degree yaw steps every 1.5 s, for measuring how the
+// game's camera follows the head (vfx-diag.js stepResponse). Needs diag=1.
+const STEP_DEG = Number(P.get("stepdeg")) || 15, STEP_MS = 1500;
+const stepTimes = [];
+const backend = P.get("backend") === "dosboxX" ? "dosboxX" : "dosbox";
+const ARCHIVE_CYCLES = "auto 6075 100% limit 33445";
+const cycles = P.get("cycles") === "max" ? "max"
+             : /^\d+$/.test(P.get("cycles") || "") ? `fixed ${P.get("cycles")}`
+             : game !== "descent" ? "fixed 3000" : ARCHIVE_CYCLES;
+const sens = Number(P.get("sens")) || 600;
+// The real VFX1 showed each eye 35.5 x 26.4 degrees (45 diagonal), described
+// by Forte as a 120 inch screen at 11 feet. Native stereo defaults to that, so
+// the game fills the same part of your view it did in the original headset.
+const VFX1_FOV_H = 35.5, VFX1_DIST = 3.35;
+const nearest = P.get("filter") === "nearest";
+// Native VFX1 stereo. Descent's -vfx mode draws the left eye in the left half
+// of a 640x480 frame and the right eye in the right half, flipping between the
+// even and odd scanlines. Stock js-dos has no VIP card to flip, so
+// vfx-stereo.js works out from the pixels which page is complete. Head
+// tracking stays on the mouse path for now.
+const stereoVfx = game === "descent" && P.get("stereo") === "vfx";
+// Descent draws its HUD and crosshair in the left eye only; by default the page
+// copies them into the right eye too. hud=left keeps the game's own behaviour.
+const hudBoth = P.get("hud") !== "left";
+// Mouse-path display width: Descent's image moves about 3.3 px per head degree
+// at sens=600 (docs/FINDINGS.md Q12), so its 320 px span about 97 degrees
+// of real view, and at that width the view turns exactly as far as the head.
+const dist = Number(P.get("dist")) || (stereoVfx ? VFX1_DIST : 2.0);
+const fovDeg = Number(P.get("fov")) || (stereoVfx ? VFX1_FOV_H : game === "descent" ? 97 : 45);
+// Native head tracking: an emulated VFX1 in our js-dos build answers the Forte
+// driver's INT 33h interface, and the page feeds it head orientation. Mouse
+// tracking turns head motion into mouse counts instead.
+const tracking = P.get("tracking") === "mouse" ? "mouse"
+               : (P.get("tracking") === "vfx1" || stereoVfx || game === "sense") ? "vfx1" : "mouse";
+const puckHand = tracking !== "vfx1" || P.get("puck") === "off" ? null
+               : P.get("puck") === "left" ? "left" : "right";
+// VRMOUSE: Forte's driver turned the CyberPuck into a mouse for games without
+// puck support, Descent included ("mouse must be selected as control device").
+// Opt-in: in the headset it was harder to fly than two controllers.
+const puckMouse = !!puckHand && P.get("puckmouse") === "on";
+const PUCK_RATE = Number(P.get("puckrate")) || 700;     // counts/s at full tilt
+// A controller has no neutral feel: in the headset the grip drifted 20 to 35
+// degrees from the rest pose within a minute, so the dead zone is generous.
+const PUCK_DEAD = 12 * Math.PI / 180, PUCK_FULL = 40 * Math.PI / 180;
+const reprojectMode = ({ lookback: "lookback", "1": "lookback", model: "model" })[P.get("reproject")] || "off";
+const reproject = reprojectMode !== "off";
+const camModel = new window.VfxReproject.CameraModel(
+  Number(P.get("camdelay")) || 85, P.has("camtau") ? Number(P.get("camtau")) : 130, 256);
+const latencyFixed = /^\d+$/.test(P.get("latency") || "") ? Number(P.get("latency")) : null;
+
+const RP = window.VfxReproject;
+const poseHistory = new RP.PoseHistory(128);           // about 1.8 s at 72 Hz
+const latency = new RP.LatencyEstimator(latencyFixed, 8);
+
+// ---- optional delay and jitter measurement ----
+const diagOn = P.get("diag") === "1";
+const DG = window.VfxDiag;
+const headLog = diagOn ? new DG.HeadLog(20000) : null;
+const frameShift = diagOn ? new DG.FrameShift() : null;
+const diagFrames = [];
+let diagSummary = null;
+
+function diagAnalyze() {
+  const recent = diagFrames.slice(-1500);
+  if (poseMode === "steps") {
+    // stepTimes[0] is the first step (to +15); stepResponse expects that order.
+    const sr = DG.stepResponse(recent, stepTimes, STEP_DEG);
+    const iv = DG.intervalStats(recent);
+    diagSummary = { mode: "steps", stepResponse: sr,
+                    frameIntervalMs: iv ? { mean: +iv.mean.toFixed(1), sd: +iv.sd.toFixed(1) } : null };
+    el("probe").textContent = sr
+      ? `steps: ${sr.steps} steps, camera 10% at ${sr.t10} ms, 50% at ${sr.t50} ms, 90% at ${sr.t90} ms, overshoot ${(sr.overshoot * 100).toFixed(0)}%`
+      : "steps: not enough frames yet";
+    window.diagSummary = diagSummary;
+    return;
+  }
+  const res = DG.analyze(recent, headLog);
+  const iv = DG.intervalStats(recent);
+  if (!res) {
+    el("probe").textContent = `diag: ${recent.length} frames, need more head motion`;
+    return;
+  }
+  const cur = res.jitterAt(latency.ms());
+  diagSummary = {
+    frames: recent.length,
+    bestLookbackMs: res.best.L,
+    pixelsPerDegree: +res.best.gain.toFixed(3),
+    fitCorrelation: +res.best.corr.toFixed(3),
+    jitterDegAtBest: res.best.rmsDeg === null ? null : +res.best.rmsDeg.toFixed(3),
+    currentLookbackMs: Math.round(latency.ms()),
+    jitterDegAtCurrent: cur && cur.rmsDeg !== null ? +cur.rmsDeg.toFixed(3) : null,
+    spanErrorDegAtBest: res.best.spanErrorDeg === null ? null : +res.best.spanErrorDeg.toFixed(3),
+    spanErrorDegAtCurrent: (() => { const e = res.spanErrorAt(latency.ms()); return e === null ? null : +e.toFixed(3); })(),
+    spanErrorDegByLookback: Object.fromEntries([0, 25, 50, 100, 150, 200, 250].map((L) => {
+      const e = res.spanErrorAt(L); return [L, e === null ? null : +e.toFixed(2)];
+    })),
+    frameIntervalMs: iv ? { mean: +iv.mean.toFixed(1), sd: +iv.sd.toFixed(1), p10: +iv.p10.toFixed(1), p90: +iv.p90.toFixed(1) } : null,
+  };
+  el("probe").textContent = `diag: best look-back ${diagSummary.bestLookbackMs} ms, ` +
+    `jitter ${diagSummary.jitterDegAtBest}° (at current ${diagSummary.currentLookbackMs} ms: ${diagSummary.jitterDegAtCurrent}°), ` +
+    `frame interval ${iv ? iv.mean.toFixed(0) : "–"}±${iv ? iv.sd.toFixed(0) : "–"} ms, fit r=${diagSummary.fitCorrelation}`;
+  window.diagSummary = diagSummary;
+}
+
+const el = (id) => document.getElementById(id);
+el("cfg").textContent = `${game}, ${backend}, pose=${poseMode}, cycles=${cycles}, sens=${sens}`;
+
+// ================================================================ bridge
+
+let bridge = null;
+async function loadBridge() {
+  bridge = await VfxBridgeModule();
+  bridge._vfxweb_configure(sens, sens, 70, P.has("inverty") ? 1 : 0, P.has("invertpitch") ? 1 : 0, 1, 1, 200);
+}
+
+let ci = null;
+let countsSent = 0;
+
+// One head orientation in, relative mouse motion out, straight into DOS.
+function driveMouse(q) {
+  if (!bridge || !ci) return;
+  if (bridge._vfxweb_update(q.w, q.x, q.y, q.z)) {
+    const dx = bridge._vfxweb_dx(), dy = bridge._vfxweb_dy();
+    ci.sendMouseRelativeMotion(dx, dy);
+    countsSent += Math.abs(dx) + Math.abs(dy);
+  }
+}
+
+// One head orientation in, VFX1 head tracker angles out, relative to the
+// orientation at the last recentre.
+let senseRef = null, lastHeadQ = null, poseEventsSent = 0, senseDeg = null;
+// CyberPuck: tilt in radians relative to the rest pose, and a 3-bit button mask.
+const puck = { pitch: 0, roll: 0, buttons: 0, rest: null, raw: null };
+// Per telemetry sample: tilt range and how many frames each button was held,
+// so a quick press between samples is not lost.
+let puckSeen = null;
+function resetPuckSeen() { puckSeen = { minPitch: 0, maxPitch: 0, minRoll: 0, maxRoll: 0, held: [0, 0, 0] }; }
+resetPuckSeen();
+function notePuck() {
+  puckSeen.minPitch = Math.min(puckSeen.minPitch, puck.pitch); puckSeen.maxPitch = Math.max(puckSeen.maxPitch, puck.pitch);
+  puckSeen.minRoll = Math.min(puckSeen.minRoll, puck.roll); puckSeen.maxRoll = Math.max(puckSeen.maxRoll, puck.roll);
+  for (let i = 0; i < 3; i++) if (puck.buttons & (1 << i)) puckSeen.held[i]++;
+}
+function driveSense(q) {
+  if (!ci) return;
+  if (!senseRef) senseRef = q;
+  const a = RP.senseAngles(RP.multiply(RP.conjugate(senseRef), q));
+  ci.sendBackendEvent({ type: "vfx1-pose", yaw: RP.senseUnits(a.yaw), pitch: RP.senseUnits(a.pitch),
+                        roll: RP.senseUnits(a.roll), puckPitch: RP.senseUnits(puck.pitch),
+                        puckRoll: RP.senseUnits(puck.roll), buttons: puck.buttons });
+  poseEventsSent++;
+  senseDeg = { yaw: a.yaw * 180 / Math.PI, pitch: a.pitch * 180 / Math.PI, roll: a.roll * 180 / Math.PI };
+}
+
+function drivePose(q) {
+  lastHeadQ = q;
+  if (tracking === "vfx1") driveSense(q); else driveMouse(q);
+}
+
+function recenter() {
+  if (bridge) bridge._vfxweb_recenter();
+  senseRef = lastHeadQ;
+  puck.rest = puck.raw;
+}
+
+// The real puck measured tilt against gravity with no yaw. tiltAngles reads the
+// controller the same way, independent of which way you face and without the
+// 180 degree roll flips yaw-pitch-roll angles have near vertical; the rest pose
+// is subtracted so a comfortable grip reads as level.
+function updatePuck(xrFrame, src) {
+  const pose = src.gripSpace && xrFrame.getPose(src.gripSpace, xrRef);
+  if (!pose) return;
+  const a = RP.tiltAngles(pose.transform.orientation);
+  puck.raw = { pitch: a.pitch, roll: a.roll };
+  if (!puck.rest) puck.rest = puck.raw;
+  // Held within +-90 degrees of rest, like the real puck's tilt sensors.
+  const lim = (v) => Math.max(-Math.PI / 2, Math.min(Math.PI / 2, v));
+  puck.pitch = lim(a.pitch - puck.rest.pitch);
+  puck.roll = lim(a.roll - puck.rest.roll);
+}
+
+// Driver and card state reported back by the emulated VFX1.
+let vfx1Stats = null;
+// Emulator time split from our js-dos build (jsdos-vfx1-prof.h), and the
+// page's own main-thread work, both in ms per real second of the last sample.
+let vfx1Prof = null, vfx1ProfAt = null;
+const pageProf = { onFrameMs: 0, uploadMs: 0, xrFrameMs: 0 };
+
+// ================================================================ fake pose
+
+// The same sweep as tests/dos/webxr_client.py: yaw about +Y, then pitch about +X.
+function fakeQuat(t) {
+  const yaw = 0.9 * Math.sin(2 * Math.PI * t / 8), pitch = 0.25 * Math.sin(2 * Math.PI * t / 5);
+  const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2), cp = Math.cos(pitch / 2), sp = Math.sin(pitch / 2);
+  return { w: cy * cp, x: cy * sp, y: sy * cp, z: -sy * sp };
+}
+
+// ================================================================ frames
+
+let frame = null, frameW = 0, frameH = 0, frameDirty = false, framesSeen = 0;
+// Render orientation of the newest frame, and of the frame on the display.
+let frameRenderQ = null, displayQ = null;
+let reprojAngleSum = 0, reprojAngleMax = 0, reprojAngleN = 0;
+
+// ================================================================ WebXR display
+
+// Native stereo: every delivered frame goes through the page-flip extractor.
+const pageFlip = stereoVfx ? new window.VfxStereo.PageFlipExtractor() : null;
+let eyeReady = false, eyeDirty = false, lastFlipAt = -Infinity;
+window.vfxStereo = () => ({ stereoVfx, stereoLive, eyeReady, shown: pageFlip && pageFlip.shown, flips: pageFlip && pageFlip.flips });
+
+let xrSession = null, xrGL = null, xrProg = null, xrTex = null, xrVao = null, xrFrames = 0;
+
+function mul4(a, b) {                       // column-major 4x4
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++)
+    for (let r = 0; r < 4; r++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+      o[c * 4 + r] = s;
+    }
+  return o;
+}
+
+function initGL(gl) {
+  const vs = `#version 300 es
+    in vec2 pos; out vec2 uv; uniform mat4 mvp; uniform vec2 uvX;
+    void main() { uv = vec2(uvX.x + (pos.x + 1.0) * 0.5 * uvX.y, (1.0 - pos.y) * 0.5); gl_Position = mvp * vec4(pos, 0.0, 1.0); }`;
+  const fs = `#version 300 es
+    precision mediump float; in vec2 uv; out vec4 color; uniform sampler2D tex;
+    void main() { color = vec4(texture(tex, uv).rgb, 1.0); }`;
+  const compile = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  xrProg = gl.createProgram();
+  gl.attachShader(xrProg, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(xrProg, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(xrProg);
+  if (!gl.getProgramParameter(xrProg, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(xrProg));
+
+  xrVao = gl.createVertexArray();
+  gl.bindVertexArray(xrVao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(xrProg, "pos");
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+  xrTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, xrTex);
+  const f = nearest ? gl.NEAREST : gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(3));
+}
+
+// ---------------------------------------------------------------- controllers
+
+const K = { left: 263, right: 262, ctrl: 341, space: 32, accel: 65, reverse: 90, up: 265, down: 264, enter: 257, esc: 256 };
+const ALL_KEYS = Object.values(K);
+const held = new Map();
+function key(code, down) {
+  if (!ci || (held.get(code) || false) === down) return;
+  held.set(code, down);
+  ci.sendKeyEvent(code, down);
+}
+
+// In flight, not just in the stereo screen mode: Descent's in-game menus keep
+// the 640x480 VFX mode but stop drawing new stereo pages, and they need Enter.
+// Tilt to mouse motion, as a rate: level sends nothing, a small dead zone
+// absorbs hand tremor, and full tilt sends PUCK_RATE counts a second. Descent
+// reads mouse counts per frame as an axis, so this acts like a joystick.
+let puckCarry = { x: 0, y: 0 }, puckLastT = null, puckButtonsSent = 0, puckCountsSent = 0;
+function puckAxis(angle) {
+  const a = Math.abs(angle);
+  if (a <= PUCK_DEAD) return 0;
+  return Math.sign(angle) * Math.min(1, (a - PUCK_DEAD) / (PUCK_FULL - PUCK_DEAD));
+}
+function drivePuckMouse(now, buttonsDown) {
+  // Active in menus too: Descent's mouse setup assigns an axis by moving the
+  // mouse and a button by pressing it. The dead zone keeps a level puck still.
+  const dt = puckLastT === null ? 0 : Math.min(0.1, (now - puckLastT) / 1000);
+  puckLastT = now;
+  if (dt > 0) {
+    // Roll right is mouse right; tilting back toward you is mouse down (toward
+    // you), so tilting forward is mouse up, which Descent treats as "forward".
+    let ax = puckAxis(puck.roll), ay = puckAxis(puck.pitch);
+    // Outside flight only the stronger tilt moves the mouse. Descent assigns a
+    // mouse axis to whichever moved over 20 counts, checking Y last, so the
+    // slight forward tip of a sideways tilt would otherwise always win.
+    if (!inStereoLevel()) {
+      if (Math.abs(ax) >= Math.abs(ay)) { ay = 0; puckCarry.y = 0; } else { ax = 0; puckCarry.x = 0; }
+    }
+    puckCarry.x += ax * PUCK_RATE * dt;
+    puckCarry.y += ay * PUCK_RATE * dt;
+    const dx = Math.trunc(puckCarry.x), dy = Math.trunc(puckCarry.y);
+    if (dx || dy) {
+      ci.sendMouseRelativeMotion(dx, dy);
+      puckCountsSent += Math.abs(dx) + Math.abs(dy);
+      puckCarry.x -= dx; puckCarry.y -= dy;
+    }
+  }
+  // Buttons: bit 0 trigger -> left, bit 1 grip -> right, bit 2 A -> middle,
+  // DOSBox's 0, 1, 2.
+  const want = buttonsDown;
+  for (let i = 0; i < 3; i++) {
+    const bit = 1 << i;
+    if ((want & bit) !== (puckButtonsSent & bit)) ci.sendMouseButton([0, 1, 2][i], !!(want & bit));
+  }
+  puckButtonsSent = want;
+}
+
+function inStereoLevel() {
+  return stereoVfx && frameW === 640 && frameH === 480 && performance.now() - lastFlipAt < 500;
+}
+
+// Controller layout, all of Descent in the right hand, with the left hand as
+// an optional extra. Descent 1.4's default keys: Ctrl primary fire, Space
+// secondary fire, A accelerate, Z reverse, arrows pitch and turn.
+//   right trigger   primary fire          left trigger    secondary fire
+//   right stick in  secondary fire        left stick fwd  accelerate
+//   right grip      accelerate            left stick back reverse
+//   right stick     pitch (menus), turn   left stick l/r  turn
+//                                         left X          recentre
+//   A Enter (menus), B Escape
+// Both hands can drive the same key, so wanted states are combined first.
+const inputFrames = {};
+function pollControllers(session, xrFrame) {
+  const want = new Map();
+  const press = (name, code, on) => {
+    want.set(code, want.get(code) || on);
+    if (on) inputFrames[name] = (inputFrames[name] || 0) + 1;
+  };
+  for (const src of session.inputSources) {
+    const gp = src.gamepad;
+    if (!gp) continue;
+    const b = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+    if (src.handedness === puckHand) {
+      updatePuck(xrFrame, src);
+      puck.buttons = (b(0) ? 1 : 0) | (b(1) ? 2 : 0) | (b(4) ? 4 : 0);   // trigger, grip, A or X
+      notePuck();
+    }
+    const ax = gp.axes[2] || 0, ay = gp.axes[3] || 0;
+    const puckAsMouse = puckMouse && src.handedness === puckHand && ci;
+    if (puckAsMouse) drivePuckMouse(performance.now(), puck.buttons);
+    if (src.handedness === "right") {
+      // With the puck as mouse, trigger and grip are mouse buttons instead.
+      press("rightTrigger", K.ctrl, b(0) && !puckAsMouse);
+      press("rightGrip", K.accel, b(1) && !puckAsMouse);
+      press("rightStickPress", K.space, b(3));
+      // A is Enter for menus. In flight shareware Descent 1.4 treats Enter as
+      // "zero the headset and toggle the HUD"; zeroing mid-flight jolts the
+      // ship, so A sends nothing while stereo frames are still arriving.
+      press("rightA", K.enter, b(4) && !inStereoLevel());
+      press("rightB", K.esc, b(5));
+      press("rightStickUp", K.up, ay < -0.6);
+      press("rightStickDown", K.down, ay > 0.6);
+      // Descent has no snap turn; the stick holds its turn keys instead.
+      press("rightStickLeft", K.left, ax < -0.6);
+      press("rightStickRight", K.right, ax > 0.6);
+    } else if (src.handedness === "left") {
+      press("leftTrigger", K.space, b(0));
+      press("leftStickForward", K.accel, ay < -0.5);
+      press("leftStickBack", K.reverse, ay > 0.5);
+      press("leftStickLeft", K.left, ax < -0.6);
+      press("leftStickRight", K.right, ax > 0.6);
+      if (b(4) && !held.get("recenter")) { recenter(); inputFrames.leftX = (inputFrames.leftX || 0) + 1; }
+      held.set("recenter", b(4));
+    }
+  }
+  for (const code of new Set([...ALL_KEYS, ...want.keys()])) key(code, want.get(code) || false);
+}
+
+// ---------------------------------------------------------------- XR loop
+
+function onXRFrame(time, xrFrame) {
+  const xrT0 = performance.now();
+  try { onXRFrameBody(time, xrFrame); } finally { pageProf.xrFrameMs += performance.now() - xrT0; }
+}
+
+function onXRFrameBody(time, xrFrame) {
+  const session = xrFrame.session;
+  session.requestAnimationFrame(onXRFrame);
+  const gl = xrGL;
+  const layer = session.renderState.baseLayer;
+  const viewer = xrFrame.getViewerPose(xrRef);
+  if (!viewer) return;
+
+  xrFrames++;
+  const headQ = viewer.transform.orientation;
+  poseHistory.push(performance.now(), headQ);            // before it becomes mouse motion
+  if (headLog) headLog.push(performance.now(), headQ);
+  if (reprojectMode === "model") camModel.update(performance.now(), poseHistory);
+  pollControllers(session, xrFrame);          // first, so the puck goes out with this pose
+  if (poseMode === "xr") drivePose(headQ);
+
+  if (stereoVfx && eyeReady && eyeDirty) {
+    // Native stereo uploads a completed page pair, not the raw frame.
+    gl.bindTexture(gl.TEXTURE_2D, xrTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, frameW, frameH >> 1, 0, gl.RGB, gl.UNSIGNED_BYTE, pageFlip.eyes);
+    eyeDirty = false;
+    frameDirty = false;
+    stereoLive = true;
+    displayQ = frameRenderQ;
+  } else if (frameDirty && frame && !(stereoVfx && eyeReady)) {
+    gl.bindTexture(gl.TEXTURE_2D, xrTex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, frameW, frameH, 0, gl.RGB, gl.UNSIGNED_BYTE, frame);
+    stereoLive = false;
+    frameDirty = false;
+    displayQ = frameRenderQ;                             // the display now shows this frame
+  }
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(xrProg);
+  gl.bindVertexArray(xrVao);
+
+  // Head-locked, the display follows the current head orientation. Reprojected,
+  // it stays along the orientation the displayed frame was rendered for, and
+  // the headset's projection re-warps it as the head moves. Position always
+  // follows the head: the original hardware was 3DOF.
+  const halfW = dist * Math.tan(fovDeg * Math.PI / 360), halfH = halfW * 0.75;
+  const placeQ = (reproject && displayQ) ? displayQ : headQ;
+  const model = RP.displayMatrix(placeQ, viewer.transform.position, dist, halfW, halfH);
+  if (reproject && displayQ) {
+    const a = RP.angleDeg(displayQ, headQ);
+    reprojAngleSum += a; reprojAngleN++;
+    if (a > reprojAngleMax) reprojAngleMax = a;
+  }
+
+  for (const view of viewer.views) {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    const mvp = mul4(view.projectionMatrix, mul4(view.transform.inverse.matrix, model));
+    gl.uniformMatrix4fv(gl.getUniformLocation(xrProg, "mvp"), false, mvp);
+    // In native stereo each eye samples its own half; otherwise the whole frame.
+    const uvX = !stereoLive ? [0, 1] : (view.eye === "right" ? [0.5, 0.5] : [0, 0.5]);
+    gl.uniform2fv(gl.getUniformLocation(xrProg, "uvX"), uvX);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+}
+
+let xrRef = null, stereoLive = false;
+async function enterVR() {
+  if (xrSession) return;
+  const canvas = el("xr");
+  xrGL = canvas.getContext("webgl2", { xrCompatible: true, antialias: false, alpha: false });
+  initGL(xrGL);
+  xrSession = await navigator.xr.requestSession("immersive-vr", { optionalFeatures: ["local"] });
+  await xrGL.makeXRCompatible();
+  xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, xrGL) });
+  xrRef = await xrSession.requestReferenceSpace("local");
+  recenter();                               // wherever you look on entry is forward
+  xrSession.addEventListener("end", () => {
+    xrSession = null;
+    for (const code of held.keys()) if (typeof code === "number") key(code, false);
+  });
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+
+// ================================================================ telemetry
+
+const samples = [];
+let lastPoseEvents = 0, lastPuckCounts = 0;
+let lastFramesSeen = 0, lastXR = 0, lastCounts = 0, lastAt = performance.now();
+async function sample() {
+  const now = performance.now(), dt = (now - lastAt) / 1000;
+  let cpu = null;
+  try { const st = await ci.asyncifyStats(); cpu = st.cpuMetrics ? st.cpuMetrics.cpuMax : null; } catch (e) { /* ignore */ }
+  const s = {
+    t: Math.round(now / 100) / 10,
+    cycles: cpu,
+    framesPerSecond: +((framesSeen - lastFramesSeen) / dt).toFixed(1),
+    xrFramesPerSecond: +((xrFrames - lastXR) / dt).toFixed(1),
+    countsPerSecond: Math.round((countsSent - lastCounts) / dt),
+    yawDeg: bridge ? +bridge._vfxweb_tracked_yaw_deg().toFixed(1) : null,
+    pitchDeg: bridge ? +bridge._vfxweb_tracked_pitch_deg().toFixed(1) : null,
+    inVR: !!xrSession,
+    reproject: reprojectMode,
+    camDelayMs: reprojectMode === "model" ? camModel.delay : null,
+    camTauMs: reprojectMode === "model" ? camModel.tau : null,
+    fovDeg,
+    latencyMs: Math.round(latency.ms()),
+    reprojMeanDeg: reprojAngleN ? +(reprojAngleSum / reprojAngleN).toFixed(2) : null,
+    reprojMaxDeg: reprojAngleN ? +reprojAngleMax.toFixed(2) : null,
+    hidden: document.hidden,
+    tracking,
+    poseEventsPerSecond: Math.round((poseEventsSent - lastPoseEvents) / dt),
+    puckMouseCountsPerSecond: puckMouse ? Math.round((puckCountsSent - lastPuckCounts) / dt) : null,
+    flying: inStereoLevel(),
+    inputFrames: Object.assign({}, inputFrames),
+    senseDeg: senseDeg ? { yaw: +senseDeg.yaw.toFixed(1), pitch: +senseDeg.pitch.toFixed(1), roll: +senseDeg.roll.toFixed(1) } : null,
+    puck: puckHand ? { hand: puckHand, pitchDeg: +(puck.pitch * 180 / Math.PI).toFixed(1),
+                       rollDeg: +(puck.roll * 180 / Math.PI).toFixed(1), buttons: puck.buttons,
+                       pitchRangeDeg: [+(puckSeen.minPitch * 180 / Math.PI).toFixed(1), +(puckSeen.maxPitch * 180 / Math.PI).toFixed(1)],
+                       rollRangeDeg: [+(puckSeen.minRoll * 180 / Math.PI).toFixed(1), +(puckSeen.maxRoll * 180 / Math.PI).toFixed(1)],
+                       framesHeld: { trigger: puckSeen.held[0], grip: puckSeen.held[1], a: puckSeen.held[2] } } : null,
+    vfx1: vfx1Stats,
+    emuProf: vfx1Prof,
+    pageMsPerSecond: { onFrame: +(pageProf.onFrameMs / dt).toFixed(1), xrFrame: +(pageProf.xrFrameMs / dt).toFixed(1) },
+  };
+  lastPoseEvents = poseEventsSent;
+  pageProf.onFrameMs = 0; pageProf.xrFrameMs = 0;
+  lastPuckCounts = puckCountsSent;
+  for (const k of Object.keys(inputFrames)) delete inputFrames[k];
+  resetPuckSeen();
+  window.vfx1Sample = s;
+  lastFramesSeen = framesSeen; lastXR = xrFrames; lastCounts = countsSent; lastAt = now;
+  samples.push(s);
+  el("stats").innerHTML = `cycles <b>${s.cycles ?? "–"}</b> · game frames/s <b>${s.framesPerSecond}</b>` +
+    ` · XR frames/s <b>${s.xrFramesPerSecond}</b>` +
+    (tracking === "vfx1"
+      ? ` · VFX1 tracker <b>${s.senseDeg ? `${s.senseDeg.yaw}°, ${s.senseDeg.pitch}°, ${s.senseDeg.roll}°` : "–"}</b>` +
+        ` · game reads <b>${vfx1Stats ? vfx1Stats.dataCalls + vfx1Stats.reportCalls : "–"}</b>`
+      : ` · mouse counts/s <b>${s.countsPerSecond}</b> · head <b>${s.yawDeg ?? "–"}°, ${s.pitchDeg ?? "–"}°</b>`) +
+    (reproject ? ` · reprojection ${reprojectMode} <b>${s.reprojMeanDeg ?? "–"}°</b> mean, <b>${s.reprojMaxDeg ?? "–"}°</b> max` +
+                 (reprojectMode === "model" ? `, camera ${camModel.delay}+${camModel.tau} ms` : `, look-back <b>${s.latencyMs} ms</b>`)
+               : " · reprojection off") + ` · display ${fovDeg}°`;
+  reprojAngleSum = 0; reprojAngleMax = 0; reprojAngleN = 0;
+}
+
+function flush(extra) {
+  if (P.has("notelemetry") || !location.protocol.startsWith("http")) return;
+  if (!samples.length && !extra) return;
+  fetch("telemetry", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ game: `vfx1-${game}`, backend, cycles, poseMode, sens, userAgent: navigator.userAgent,
+                           stereo: stereoVfx ? { mode: "vfx", live: stereoLive, flips: pageFlip.flips } : "mono",
+                           samples: samples.splice(0), ...(extra || {}) }) }).catch(() => {});
+}
+
+// ================================================================ probe mode
+
+async function runProbe() {
+  const t0 = performance.now();
+  while (performance.now() - t0 < 120000) {
+    await new Promise((r) => setTimeout(r, 500));
+    const flat = {};
+    (function walk(n) { if (n.nodes) n.nodes.forEach(walk); else flat[n.name.toUpperCase()] = n.size; })(await ci.fsTree());
+    if ((flat["OUT.TXT"] || 0) > 20) {
+      const text = new TextDecoder().decode(await ci.fsReadFile("OUT.TXT")).trim();
+      el("probe").textContent = `probe: ${text}`;
+      window.probeResult = text;
+      flush({ probe: text });
+      return;
+    }
+  }
+  el("probe").textContent = "probe: no result after 2 minutes";
+}
+
+// ================================================================ boot
+
+async function start() {
+  el("start").hidden = true;
+  if (typeof Dos !== "function") { el("stats").textContent = "js-dos did not load. Is this device online?"; return; }
+  await loadBridge();
+
+  let initFs, conf;
+  if (game === "sense") {
+    const com = new Uint8Array(await (await fetch("SENSE.COM", { cache: "no-store" })).arrayBuffer());
+    initFs = [{ path: "SENSE.COM", contents: com }];
+    conf = `[cpu]\ncore=normal\ncycles=${cycles}\n\n[autoexec]\nmount c .\nc:\nSENSE.COM > OUT.TXT\n`;
+  } else if (game === "probe") {
+    const com = new Uint8Array(await (await fetch("INT33.COM", { cache: "no-store" })).arrayBuffer());
+    initFs = [{ path: "INT33.COM", contents: com }];
+    conf = `[cpu]\ncore=normal\ncycles=${cycles}\n\n[autoexec]\nmount c .\nc:\nINT33.COM > OUT.TXT\n`;
+  } else {
+    const res = await fetch("games/descent-sw.zip", { cache: "no-store" });
+    if (!res.ok) { el("stats").textContent = `games/descent-sw.zip: HTTP ${res.status}. Run web/pack-game.py first.`; return; }
+    initFs = [new Uint8Array(await res.arrayBuffer())];
+    conf = `[sdl]\nautolock=false\n\n[dosbox]\nmemsize=16\n\n[cpu]\ncore=normal\ncputype=auto\ncycles=${cycles}\n\n` +
+           `[autoexec]\nmount c .\nc:\ncd DESCENT\nloadfix\n` +
+           `set VIPPORT=260\ndos32a DCNTSHR.EXE${stereoVfx ? " -vfx" : ""}${tracking === "vfx1" ? " -vfxtrak" : ""}\n`;
+  }
+
+  el("stats").textContent = "booting…";
+  Dos(el("dos"), {
+    dosboxConf: conf,
+    initFs,
+    backend,
+    backendLocked: true,
+    // Native tracking needs our DOSBox build with the VFX1 device; the rest of
+    // js-dos still comes from its CDN.
+    ...(tracking === "vfx1" ? { pathPrefix: P.get("emulators") || "emulators/" } : {}),
+    workerThread: true,
+    offscreenCanvas: false,                 // frames must reach this page for the VR display
+    autoStart: true,
+    mouseCapture: false,
+    onEvent: (event, arg) => {
+      if (event !== "ci-ready") return;
+      ci = arg;
+      window.ci = ci;
+      ci.events().onFrameSize((w, h) => { frameW = w; frameH = h; });
+      ci.events().onFrame((rgb, rgba) => {
+        const pageT0 = performance.now();
+        // js-dos hands over RGB when it has it; fall back to dropping alpha.
+        if (rgb) { frame = rgb; }
+        else if (rgba) {
+          const n = rgba.length / 4, out = new Uint8Array(n * 3);
+          for (let i = 0, j = 0; i < n; i++, j += 3) { out[j] = rgba[i * 4]; out[j + 1] = rgba[i * 4 + 1]; out[j + 2] = rgba[i * 4 + 2]; }
+          frame = out;
+        }
+        // Parity is judged on every delivered frame: comparing only the frames
+        // the headset happens to upload would skip pages and guess wrong.
+        eyeReady = !!(stereoVfx && frame && frameW === 640 && frameH === 480);
+        if (eyeReady && pageFlip.feed(frame, frameW, frameH)) {
+          lastFlipAt = performance.now();
+          if (hudBoth) window.VfxStereo.mirrorHud(pageFlip.eyes, frameW, frameH >> 1);
+          eyeDirty = true;
+        }
+        frameDirty = true;
+        framesSeen++;
+        // Which head orientation was this frame rendered for? Look back about
+        // one game frame from its arrival. Null until the XR loop records poses.
+        const arrived = performance.now();
+        latency.frameArrived(arrived);
+        frameRenderQ = reprojectMode === "model" ? camModel.at(arrived)
+                                                 : poseHistory.at(arrived - latency.ms());
+        pageProf.onFrameMs += performance.now() - pageT0;
+        if (frameShift && frame && frameW && frameH) {
+          const r = frameShift.feed(frame, frameW, frameH);
+          if (r) diagFrames.push({ t: arrived, shift: r.shift, ok: r.quality >= 0.3 });
+          if (diagFrames.length > 4000) diagFrames.splice(0, 2000);
+        }
+      });
+      if (diagOn) setInterval(diagAnalyze, 5000);
+      el("recenter").disabled = false;
+      setInterval(sample, 2000);
+      setInterval(() => flush(diagSummary ? { diag: diagSummary } : undefined), 10000);
+
+      if (poseMode === "fake" || poseMode === "steps") {
+        const t0 = performance.now();
+        let lastStep = -1;
+        setInterval(() => {
+          const now = performance.now();
+          let q;
+          if (poseMode === "steps") {
+            const idx = Math.floor((now - t0) / STEP_MS);
+            if (idx !== lastStep) { stepTimes.push(now); lastStep = idx; }
+            const yaw = (idx % 2 === 0 ? STEP_DEG : 0) * Math.PI / 180;
+            q = { w: Math.cos(yaw / 2), x: 0, y: Math.sin(yaw / 2), z: 0 };
+          } else {
+            q = fakeQuat((now - t0) / 1000);
+            if (puckHand) {
+              const t = (now - t0) / 1000;
+              puck.pitch = 0.5 * Math.sin(2 * Math.PI * t / 3);
+              puck.roll = -0.3 * Math.sin(2 * Math.PI * t / 4);
+              puck.buttons = Math.floor(t) % 8;
+            }
+          }
+          poseHistory.push(now, q);
+          if (headLog) headLog.push(now, q);
+          if (reprojectMode === "model") camModel.update(now, poseHistory);
+          drivePose(q);
+        }, 11);
+      }
+      if (game !== "descent") runProbe();
+      if (tracking === "vfx1") {
+        ci.events().onStdout((message) => {
+          if (message.startsWith("vfx1-stats ")) vfx1Stats = JSON.parse(message.slice(11));
+          if (message.startsWith("vfx1-prof ")) {
+            const now = performance.now(), raw = JSON.parse(message.slice(10));
+            if (vfx1ProfAt !== null) {
+              const secs = (now - vfx1ProfAt) / 1000, perSec = {};
+              for (const k of Object.keys(raw.ms)) perSec[k] = +(raw.ms[k] / secs).toFixed(1);
+              vfx1Prof = { msPerSecond: perSec, calls: raw.calls, seconds: +secs.toFixed(2) };
+            }
+            vfx1ProfAt = now;
+          }
+        });
+        setInterval(() => {
+          ci.sendBackendEvent({ type: "vfx1-stats" });
+          ci.sendBackendEvent({ type: "vfx1-prof" });
+        }, 2000);
+      }
+    },
+  });
+
+  if (navigator.xr && poseMode === "xr") {
+    navigator.xr.isSessionSupported("immersive-vr").then((ok) => { el("enter-vr").disabled = !ok; }).catch(() => {});
+  }
+}
+
+el("go").addEventListener("click", start, { once: true });
+el("enter-vr").addEventListener("click", () => enterVR().catch((e) => { el("stats").textContent = `VR failed: ${e.message}`; }));
+el("recenter").addEventListener("click", recenter);
+window.addEventListener("keydown", (e) => { if (e.key === "F12") recenter(); });
+if (P.has("auto")) start();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+build/
+build-cmake/
+*.o
+*.d
+*.a
+*.png
+__pycache__/
+.claude/

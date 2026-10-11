@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vfx-reproject.js tests</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 20px; }
+  .pass { color: #1d7a49; } .fail { color: #b3261e; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>vfx-reproject.js tests</h1>
+<div id="summary">running…</div>
+<pre id="out"></pre>
+<script src="vfx-reproject.js"></script>
+<script>
+(() => {
+"use strict";
+const R = window.VfxReproject;
+const out = document.getElementById("out");
+let checks = 0, failures = 0;
+function check(name, ok, detail) {
+  checks++;
+  if (!ok) failures++;
+  out.innerHTML += `<span class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</span> ${name}${detail ? " — " + detail : ""}\n`;
+}
+const near = (a, b, tol = 1e-4) => Math.abs(a - b) <= tol;
+const yawQ = (deg) => ({ w: Math.cos(deg * Math.PI / 360), x: 0, y: Math.sin(deg * Math.PI / 360), z: 0 });
+const pitchQ = (deg) => ({ w: Math.cos(deg * Math.PI / 360), x: Math.sin(deg * Math.PI / 360), y: 0, z: 0 });
+function apply(m, v) {                     // column-major 4x4 times (x, y, z, 1)
+  return { x: m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12],
+           y: m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13],
+           z: m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] };
+}
+
+// ---- rigidMatrix agrees with the browser's own XRRigidTransform ----
+if (typeof XRRigidTransform === "function") {
+  const cases = [
+    [{ w: 1, x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 0 }],
+    [R.multiply(yawQ(37), pitchQ(-21)), { x: 0.1, y: 1.6, z: -0.3 }],
+    [R.normalize({ w: 0.3, x: -0.5, y: 0.7, z: 0.2 }), { x: -2, y: 0.5, z: 4 }],
+  ];
+  for (const [q, p] of cases) {
+    const ref = new XRRigidTransform(p, q).matrix;
+    const mine = R.rigidMatrix(q, p);
+    let worst = 0;
+    for (let i = 0; i < 16; i++) worst = Math.max(worst, Math.abs(ref[i] - mine[i]));
+    check(`rigidMatrix matches XRRigidTransform for q=(${q.w.toFixed(2)},${q.x.toFixed(2)},${q.y.toFixed(2)},${q.z.toFixed(2)})`,
+          worst < 1e-5, `max element difference ${worst.toExponential(2)}`);
+  }
+} else {
+  check("XRRigidTransform available for ground truth", false, "this browser has no WebXR; matrix ground truth skipped");
+}
+
+// ---- yaw convention: +yaw turns the forward axis (-Z) toward -X, i.e. left ----
+{
+  const m = R.rigidMatrix(yawQ(90), { x: 0, y: 0, z: 0 });
+  const f = apply(m, { x: 0, y: 0, z: -1 });
+  check("yaw +90 sends forward (-Z) to -X", near(f.x, -1) && near(f.z, 0));
+}
+
+// ---- display placement ----
+{
+  const pos = { x: 0, y: 1.6, z: 0 };
+  const m = R.displayMatrix(yawQ(0), pos, 2, 0.8, 0.6);
+  const centre = apply(m, { x: 0, y: 0, z: 0 });
+  const corner = apply(m, { x: 1, y: 1, z: 0 });
+  check("display centre sits dist metres ahead of the head", near(centre.x, 0) && near(centre.y, 1.6) && near(centre.z, -2));
+  check("display corner is offset by the half extents", near(corner.x, 0.8) && near(corner.y, 2.2) && near(corner.z, -2));
+
+  // Placed along a render pose of yaw 30: centre must be along that direction.
+  const r = R.displayMatrix(yawQ(30), pos, 2, 0.8, 0.6);
+  const c = apply(r, { x: 0, y: 0, z: 0 });
+  check("display placed along a yaw-30 render pose points 30 degrees left",
+        near(c.x, -2 * Math.sin(Math.PI / 6)) && near(c.z, -2 * Math.cos(Math.PI / 6)));
+}
+
+// ---- reprojection is the same maths as src/bridge/reproject.c ----
+// A world point shown at display coordinate u under render pose q_r, seen from
+// current pose q_c, must land where the C formula says: rotate the current-view
+// ray by conj(q_r) * q_c and project.
+{
+  const dist = 2, halfW = dist * Math.tan(22.5 * Math.PI / 180), halfH = halfW * 0.75;
+  const qr = yawQ(10), qc = yawQ(15);
+  const pos = { x: 0, y: 0, z: 0 };
+  const m = R.displayMatrix(qr, pos, dist, halfW, halfH);
+  const world = apply(m, { x: 0, y: 0, z: 0 });            // centre of the rendered frame
+  const toHead = R.rigidMatrix(R.conjugate(qc), { x: 0, y: 0, z: 0 });
+  const inHead = apply(toHead, world);
+  const uGeometry = (inHead.x / -inHead.z) / (halfW / dist);
+  // tests/test_reproject.c: with the head turned yaw degrees further left than
+  // the frame was rendered, the frame centre lands at ndc_x = tan(yaw)/tan(fov/2).
+  const uFormula = Math.tan((15 - 10) * Math.PI / 180) / Math.tan(22.5 * Math.PI / 180);
+  check("frame centre lands where reproject.c's formula puts it", near(uGeometry, uFormula, 1e-5),
+        `geometry ${uGeometry.toFixed(5)}, formula ${uFormula.toFixed(5)}`);
+  check("turning further left than the frame moves the image right", uGeometry > 0);
+}
+
+// ---- slerp and angle ----
+{
+  const m = R.slerp(yawQ(0), yawQ(40), 0.5);
+  check("slerp midpoint of 0 and 40 degrees is 20", near(R.angleDeg(m, yawQ(0)), 20, 1e-3));
+  const negated = { w: -yawQ(40).w, x: 0, y: -yawQ(40).y, z: 0 };
+  check("slerp takes the short way to a negated quaternion", near(R.angleDeg(R.slerp(yawQ(0), negated, 0.5), yawQ(0)), 20, 1e-3));
+  check("angleDeg of identical orientations is 0", near(R.angleDeg(yawQ(33), yawQ(33)), 0, 1e-3));
+}
+
+// ---- pose history ----
+{
+  const h = new R.PoseHistory(8);
+  check("empty history returns null", h.at(0) === null);
+  for (let i = 0; i < 20; i++) h.push(i * 10, yawQ(i));     // wraps the ring
+  check("interpolates between samples", near(R.angleDeg(h.at(155), yawQ(0)), 15.5, 1e-3));
+  check("clamps to newest after the window", near(R.angleDeg(h.at(9999), yawQ(0)), 19, 1e-3));
+  check("clamps to oldest before the window", near(R.angleDeg(h.at(0), yawQ(0)), 12, 1e-3));
+}
+
+// ---- latency estimate ----
+{
+  const e = new R.LatencyEstimator(null, 8);
+  for (let t = 0; t < 5000; t += 45) e.frameArrived(t);      // a steady 22 fps game
+  check("auto latency converges to one frame interval plus transport", near(e.ms(), 53, 0.5), `${e.ms().toFixed(1)} ms`);
+  const f = new R.LatencyEstimator(70);
+  f.frameArrived(0); f.frameArrived(40);
+  check("a fixed latency overrides the estimate", f.ms() === 70);
+  const g = new R.LatencyEstimator(null, 8);
+  g.frameArrived(0); g.frameArrived(3000);                    // a pause, ignored
+  check("a long pause does not poison the estimate", near(g.ms(), 58, 1e-6), `${g.ms()} ms`);
+}
+
+// ---- camera model: delay then first-order easing ----
+{
+  const T = 85, tau = 130, step = 10;
+  const head = new R.PoseHistory(4096);
+  const model = new R.CameraModel(T, tau, 4096);
+  const stepAt = 1000;
+  let t10 = null, t50 = null, t90 = null;
+  for (let t = 0; t <= 3000; t += 1000 / 72) {
+    head.push(t, yawQ(t >= stepAt ? step : 0));
+    model.update(t, head);
+    const q = model.at(t);
+    if (!q) continue;
+    const frac = R.angleDeg(q, yawQ(0)) / step;
+    if (t >= stepAt) {
+      if (t10 === null && frac >= 0.1) t10 = t - stepAt;
+      if (t50 === null && frac >= 0.5) t50 = t - stepAt;
+      if (t90 === null && frac >= 0.9) t90 = t - stepAt;
+    }
+  }
+  const tick = 1000 / 72;
+  check("camera model: 10% at delay + 0.105 tau", Math.abs(t10 - (T + 0.105 * tau)) <= 2 * tick, `${t10.toFixed(0)} ms vs ${(T + 0.105 * tau).toFixed(0)}`);
+  check("camera model: 50% at delay + 0.693 tau", Math.abs(t50 - (T + 0.693 * tau)) <= 2 * tick, `${t50.toFixed(0)} ms vs ${(T + 0.693 * tau).toFixed(0)}`);
+  check("camera model: 90% at delay + 2.303 tau", Math.abs(t90 - (T + 2.303 * tau)) <= 2 * tick, `${t90.toFixed(0)} ms vs ${(T + 2.303 * tau).toFixed(0)}`);
+  const settled = R.angleDeg(model.at(3000), yawQ(step));
+  check("camera model settles on the head orientation", settled < 0.05, `${settled.toFixed(3)} deg off`);
+}
+
+// ---- VFX1 head tracker angles ----
+{
+  const deg = (r) => r * 180 / Math.PI;
+  const rollQ = (d) => ({ w: Math.cos(-d * Math.PI / 360), x: 0, y: 0, z: Math.sin(-d * Math.PI / 360) });
+  let a = R.senseAngles(yawQ(30));
+  check("senseAngles: turning left 30 degrees is yaw +30", near(deg(a.yaw), 30, 1e-6) && near(a.pitch, 0, 1e-9) && near(a.roll, 0, 1e-9));
+  a = R.senseAngles(pitchQ(20));
+  check("senseAngles: looking up 20 degrees is pitch +20", near(deg(a.pitch), 20, 1e-6) && near(a.yaw, 0, 1e-9));
+  a = R.senseAngles(rollQ(15));
+  check("senseAngles: tilting right 15 degrees is roll +15", near(deg(a.roll), 15, 1e-6) && near(a.yaw, 0, 1e-9));
+  {
+    // tilting right lifts the left ear: +X (right ear) goes down
+    const m = R.rigidMatrix(rollQ(15), { x: 0, y: 0, z: 0 });
+    const ear = apply(m, { x: 1, y: 0, z: 0 });
+    check("roll +15 lowers the right ear", ear.y < 0, `right ear y ${ear.y.toFixed(3)}`);
+  }
+  a = R.senseAngles(R.multiply(R.multiply(yawQ(-120), pitchQ(-35)), rollQ(25)));
+  check("senseAngles recovers yaw, pitch, roll applied in that order",
+        near(deg(a.yaw), -120, 1e-4) && near(deg(a.pitch), -35, 1e-4) && near(deg(a.roll), 25, 1e-4),
+        `${deg(a.yaw).toFixed(3)}, ${deg(a.pitch).toFixed(3)}, ${deg(a.roll).toFixed(3)}`);
+  check("senseUnits: quarter turn is 16384, half turn wraps to -32768",
+        R.senseUnits(Math.PI / 2) === 16384 && R.senseUnits(-Math.PI / 2) === -16384 && R.senseUnits(Math.PI) === -32768);
+}
+
+// ---- CyberPuck tilt ----
+{
+  const deg = (r) => r * 180 / Math.PI;
+  const rollQ = (d) => ({ w: Math.cos(-d * Math.PI / 360), x: 0, y: 0, z: Math.sin(-d * Math.PI / 360) });
+  let t = R.tiltAngles(pitchQ(30));
+  check("tiltAngles: nose up 30 degrees is pitch +30", near(deg(t.pitch), 30, 1e-6) && near(t.roll, 0, 1e-9));
+  t = R.tiltAngles(rollQ(20));
+  check("tiltAngles: tilted right 20 degrees is roll +20", near(deg(t.roll), 20, 1e-6) && near(t.pitch, 0, 1e-9));
+  t = R.tiltAngles(R.multiply(yawQ(137), pitchQ(-25)));
+  check("tiltAngles ignores which way the device faces", near(deg(t.pitch), -25, 1e-6) && near(t.roll, 0, 1e-9));
+  // Sweep through pointing straight down while tilted: senseAngles flips roll
+  // by 180 degrees there; tiltAngles must change smoothly.
+  let worst = 0, prev = null;
+  for (let p = -60; p >= -120; p -= 1) {
+    const cur = R.tiltAngles(R.multiply(pitchQ(p), rollQ(15)));
+    if (prev) worst = Math.max(worst, Math.abs(deg(cur.roll - prev.roll)), Math.abs(deg(cur.pitch - prev.pitch)));
+    prev = cur;
+  }
+  check("tiltAngles has no jumps through vertical", worst < 2, `largest step ${worst.toFixed(2)} deg per degree of motion`);
+}
+
+document.getElementById("summary").innerHTML =
+  `<b class="${failures ? "fail" : "pass"}">${checks} checks, ${failures} failures</b>`;
+window.testResult = { checks, failures };
+})();
+</script>
+</body>
+</html>

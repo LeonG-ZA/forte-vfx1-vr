@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VFX1 head tracking</title>
+<!--
+  The WebXR adapter for the DOSBox VFX1 bridge.
+
+  This page is the ONLY part of the project that names WebXR. It reads the
+  viewer pose each XR frame and sends the orientation quaternion to the
+  emulator over a WebSocket on the loopback interface. Everything below that
+  socket is transport-neutral, which is the layering rule.
+
+  Served by DOSBox-X itself at http://localhost:<port>/ so that it counts as a
+  secure context, which WebXR requires. Open it in the headset's browser, or
+  in a desktop browser with a headset attached, and press Start.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f6f4; --fg: #16181d; --muted: #5b6070;
+    --line: #d7d9e0; --ok: #1c7c4a; --bad: #b3261e; --card: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --fg: #e8eaf0; --muted: #9aa1b1;
+      --line: #2c3038; --ok: #4ac07f; --bad: #ef6b62; --card: #1b1e24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 40rem; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  p.sub { color: var(--muted); margin: 0 0 1.5rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; margin-bottom: 14px;
+  }
+  button {
+    font: inherit; font-weight: 600; padding: .6rem 1.1rem; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--fg); color: var(--bg);
+    cursor: pointer;
+  }
+  button.secondary { background: transparent; color: var(--fg); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem;
+       margin: 0; font-variant-numeric: tabular-nums; }
+  dt { color: var(--muted); }
+  dd { margin: 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  #log {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px;
+    white-space: pre-wrap; max-height: 11rem; overflow-y: auto;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>VFX1 head tracking</h1>
+  <p class="sub">Sends your headset's orientation to DOSBox-X as INT&nbsp;33h mouse motion.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="start" disabled>Start head tracking</button>
+      <button id="recenter" class="secondary" disabled>Recentre</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <dl>
+      <dt>WebXR</dt>       <dd id="xr">checking…</dd>
+      <dt>Emulator</dt>    <dd id="ws">not connected</dd>
+      <dt>Session</dt>     <dd id="sess">not started</dd>
+      <dt>Poses sent</dt>  <dd id="sent">0</dd>
+      <dt>Rate</dt>        <dd id="rate">–</dd>
+      <dt>Yaw / pitch</dt> <dd id="ypr">–</dd>
+    </dl>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---------------------------------------------------------------- socket
+
+let ws = null;
+let sent = 0;
+let lastRateAt = 0;
+let lastRateCount = 0;
+
+function wsUrl() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/pose`;
+}
+
+function connect() {
+  return new Promise((resolve, reject) => {
+    let s;
+    try {
+      s = new WebSocket(wsUrl());
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    s.onopen = () => {
+      ws = s;
+      $("ws").textContent = "connected";
+      $("ws").className = "ok";
+      log(`connected to ${wsUrl()}`);
+      resolve(s);
+    };
+    s.onerror = () => {
+      $("ws").textContent = "connection failed";
+      $("ws").className = "bad";
+      reject(new Error("websocket error"));
+    };
+    s.onclose = () => {
+      ws = null;
+      $("ws").textContent = "disconnected";
+      $("ws").className = "bad";
+      log("emulator disconnected");
+    };
+  });
+}
+
+function send(line) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(line);
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- WebXR
+
+let session = null;
+let refSpace = null;
+
+async function checkSupport() {
+  if (!navigator.xr) {
+    $("xr").textContent = "not available in this browser";
+    $("xr").className = "bad";
+    log("navigator.xr is missing. Use a WebXR-capable browser over https or localhost.");
+    return false;
+  }
+  let ok = false;
+  try {
+    ok = await navigator.xr.isSessionSupported("immersive-vr");
+  } catch (e) {
+    log(`isSessionSupported threw: ${e.message}`);
+  }
+  if (ok) {
+    $("xr").textContent = "immersive-vr supported";
+    $("xr").className = "ok";
+  } else {
+    $("xr").textContent = "no immersive-vr device";
+    $("xr").className = "bad";
+    log("No immersive-vr device. Is the headset connected and its runtime running?");
+  }
+  $("start").disabled = !ok;
+  return ok;
+}
+
+// The emulator's convention, matching include/vfx/vfxcore_api.h: right-handed,
+// +Y up, +Z toward the viewer. WebXR uses exactly the same convention, so the
+// quaternion passes through untouched. Documented here because that is a
+// coincidence worth not relying on silently.
+function poseLine(orientation, t) {
+  const { w, x, y, z } = orientation;
+  return `P ${w.toFixed(6)} ${x.toFixed(6)} ${y.toFixed(6)} ${z.toFixed(6)} ${t.toFixed(1)}`;
+}
+
+function onXRFrame(time, frame) {
+  if (!session) return;
+  session.requestAnimationFrame(onXRFrame);
+
+  const viewer = frame.getViewerPose(refSpace);
+  if (!viewer) return;
+
+  const q = viewer.transform.orientation;
+  if (send(poseLine(q, time))) {
+    sent++;
+    $("sent").textContent = String(sent);
+  }
+
+  if (time - lastRateAt > 500) {
+    const hz = ((sent - lastRateCount) * 1000) / (time - lastRateAt);
+    $("rate").textContent = `${hz.toFixed(0)} Hz`;
+    lastRateAt = time;
+    lastRateCount = sent;
+
+    // Yaw and pitch, purely so the user can see it responding.
+    const yaw = Math.atan2(2 * (q.x * q.z + q.w * q.y),
+                           1 - 2 * (q.x * q.x + q.y * q.y));
+    let sp = 2 * (q.w * q.x - q.y * q.z);
+    sp = Math.max(-1, Math.min(1, sp));
+    const pitch = Math.asin(sp);
+    const deg = (r) => (r * 180 / Math.PI).toFixed(1);
+    $("ypr").textContent = `${deg(yaw)}° / ${deg(pitch)}°`;
+  }
+}
+
+async function start() {
+  $("start").disabled = true;
+  try {
+    if (!ws) await connect();
+  } catch (e) {
+    log(`could not reach the emulator: ${e.message}`);
+    log("Is DOSBox-X running with headtracking=true and posesource=webxr?");
+    $("start").disabled = false;
+    return;
+  }
+
+  try {
+    session = await navigator.xr.requestSession("immersive-vr");
+  } catch (e) {
+    log(`requestSession failed: ${e.message}`);
+    $("start").disabled = false;
+    return;
+  }
+
+  session.addEventListener("end", () => {
+    session = null;
+    refSpace = null;
+    $("sess").textContent = "ended";
+    $("sess").className = "";
+    $("start").disabled = false;
+    $("stop").disabled = true;
+    $("recenter").disabled = true;
+    log("XR session ended");
+  });
+
+  // "local" is enough: the emulator uses orientation only, because the real
+  // VFX1 hardware was 3DOF and the games never asked for position.
+  try {
+    refSpace = await session.requestReferenceSpace("local");
+  } catch (e) {
+    refSpace = await session.requestReferenceSpace("viewer");
+    log('falling back to the "viewer" reference space');
+  }
+
+  $("sess").textContent = "running";
+  $("sess").className = "ok";
+  $("stop").disabled = false;
+  $("recenter").disabled = false;
+  log("XR session started, streaming poses");
+
+  sent = 0;
+  lastRateAt = 0;
+  lastRateCount = 0;
+  session.requestAnimationFrame(onXRFrame);
+}
+
+$("start").addEventListener("click", start);
+$("stop").addEventListener("click", () => { if (session) session.end(); });
+$("recenter").addEventListener("click", () => {
+  if (send("R")) log("recentre sent");
+});
+
+checkSupport();
+log("Page served by DOSBox-X. Press Start, then put the headset on.");
+</script>
+</body>
+</html>

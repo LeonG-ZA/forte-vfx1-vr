@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vfx-stereo.js tests</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 20px; }
+  .pass { color: #1d7a49; } .fail { color: #b3261e; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>vfx-stereo.js tests</h1>
+<div id="summary">running…</div>
+<pre id="out"></pre>
+<script src="vfx-stereo.js"></script>
+<script>
+(() => {
+"use strict";
+const S = window.VfxStereo;
+const out = document.getElementById("out");
+let checks = 0, failures = 0;
+function check(name, ok, detail) {
+  checks++;
+  if (!ok) failures++;
+  out.innerHTML += `<span class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</span> ${name}${detail ? " — " + detail : ""}\n`;
+}
+
+const W = 640, H = 480;
+// A game frame's pixel: which game frame id drew it, and which eye.
+const frame = () => new Uint8Array(W * H * 3);
+function drawPage(buf, parity, id, rows) {       // rows: [from, to) in page rows
+  const [a, b] = rows || [0, H / 2];
+  for (let py = a; py < b; py++) {
+    const y = 2 * py + parity;
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 3;
+      buf[i] = id; buf[i + 1] = x < W / 2 ? 10 : 20; buf[i + 2] = py & 0xff;
+    }
+  }
+}
+// What game frame id and eyes the extractor currently shows.
+function shownIds(ex) {
+  const ids = new Set();
+  for (let y = 0; y < H / 2; y += 7) ids.add(ex.eyes[(y * W + 5) * 3]);
+  const left = ex.eyes[(10 * W + 5) * 3 + 1], right = ex.eyes[(10 * W + W - 5) * 3 + 1];
+  return { ids: [...ids], left, right };
+}
+
+// ---- first frame is shown straight away ----
+{
+  const ex = new S.PageFlipExtractor(), f = frame();
+  drawPage(f, 0, 1); drawPage(f, 1, 1);
+  check("first frame produces eyes", ex.feed(f, W, H) && ex.eyes.length === W * (H / 2) * 3);
+  const s = shownIds(ex);
+  check("eyes keep left half left and right half right", s.left === 10 && s.right === 20, JSON.stringify(s));
+}
+
+// ---- one page per delivery: each page is shown one delivery after it is drawn ----
+{
+  const ex = new S.PageFlipExtractor(), f = frame();
+  ex.feed(f, W, H);
+  const shown = [];
+  for (let id = 2; id < 12; id++) {
+    drawPage(f, id & 1, id);
+    if (ex.feed(f, W, H)) shown.push(shownIds(ex).ids.join(","));
+  }
+  check("alternating pages flip every delivery after the first", shown.length === 9, shown.join(" "));
+  check("each shown page is whole and is the previous game frame", shown.every((s, k) => s === String(k + 2)), shown.join(" "));
+}
+
+// ---- a page drawn across two deliveries is never shown half drawn ----
+{
+  const ex = new S.PageFlipExtractor(), f = frame();
+  drawPage(f, 0, 1); drawPage(f, 1, 1);
+  ex.feed(f, W, H);
+  drawPage(f, 1, 2, [0, 120]);
+  check("top half of a page: nothing new shown", ex.feed(f, W, H) === false);
+  drawPage(f, 1, 2, [120, 240]);
+  check("bottom half of the same page: still waiting", ex.feed(f, W, H) === false);
+  drawPage(f, 0, 3);
+  check("next page starts: the finished one is shown", ex.feed(f, W, H) === true && ex.shown === 1);
+  const s = shownIds(ex);
+  check("shown page is entirely game frame 2", s.ids.length === 1 && s.ids[0] === 2, JSON.stringify(s));
+}
+
+// ---- a delivery with no change completes the pending page ----
+{
+  const ex = new S.PageFlipExtractor(), f = frame();
+  ex.feed(f, W, H);
+  drawPage(f, 1, 5);
+  check("page drawn: pending", ex.feed(f, W, H) === false);
+  check("unchanged delivery: page shown", ex.feed(f, W, H) === true && shownIds(ex).ids.join() === "5");
+  check("further unchanged deliveries: nothing new", ex.feed(f, W, H) === false && ex.feed(f, W, H) === false);
+}
+
+// ---- the same parity drawn twice in a row waits for the second ----
+{
+  const ex = new S.PageFlipExtractor(), f = frame();
+  ex.feed(f, W, H);
+  drawPage(f, 1, 7); ex.feed(f, W, H);
+  drawPage(f, 1, 8);
+  check("same parity again: not shown yet", ex.feed(f, W, H) === false);
+  drawPage(f, 0, 9);
+  check("then other parity: shows the later frame", ex.feed(f, W, H) === true && shownIds(ex).ids.join() === "8");
+}
+
+// ---- HUD mirroring ----
+{
+  const w = 8, h = 2, eyes = new Uint8Array(w * h * 3);
+  const set = (x, y, r, g, b) => eyes.set([r, g, b], (y * w + x) * 3);
+  const get = (x, y) => Array.from(eyes.subarray((y * w + x) * 3, (y * w + x) * 3 + 3)).join(",");
+  set(1, 0, 0, 255, 0);       // HUD green, left eye
+  set(2, 1, 0, 117, 0);       // darker HUD green
+  set(3, 0, 10, 255, 0);      // world pixel: has red
+  set(0, 1, 0, 40, 0);        // too dark to be HUD
+  set(5, 0, 50, 60, 70);      // right eye world pixel under the HUD
+  const n = S.mirrorHud(eyes, w, h);
+  check("mirrorHud copies pure greens into the right eye", n === 2 && get(5, 0) === "0,255,0" && get(6, 1) === "0,117,0",
+        `copied ${n}, (5,0)=${get(5, 0)} (6,1)=${get(6, 1)}`);
+  check("mirrorHud leaves other pixels alone", get(7, 0) === "0,0,0" && get(4, 1) === "0,0,0" && get(1, 0) === "0,255,0");
+}
+
+// ---- change counting ----
+{
+  const a = frame(), b = frame();
+  drawPage(b, 1, 1);
+  const c = S.changedPerParity(b, a, W, H, 8);
+  check("changedPerParity sees only the odd rows", c[0] === 0 && c[1] === (H / 2) * (W / 8), JSON.stringify(c));
+}
+
+document.getElementById("summary").innerHTML =
+  `<b class="${failures ? "fail" : "pass"}">${checks - failures}/${checks} checks passed</b>`;
+window.testResult = { checks, failures };
+})();
+</script>
+</body>
+</html>

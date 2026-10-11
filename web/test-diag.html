@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vfx-diag.js tests</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 20px; }
+  .pass { color: #1d7a49; } .fail { color: #b3261e; font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>vfx-diag.js tests</h1>
+<div id="summary">running…</div>
+<pre id="out"></pre>
+<script src="vfx-diag.js"></script>
+<script>
+(() => {
+"use strict";
+const D = window.VfxDiag;
+const out = document.getElementById("out");
+let checks = 0, failures = 0;
+function check(name, ok, detail) {
+  checks++; if (!ok) failures++;
+  out.innerHTML += `<span class="${ok ? "pass" : "fail"}">${ok ? "PASS" : "FAIL"}</span> ${name}${detail ? " — " + detail : ""}\n`;
+}
+const yawQ = (deg) => ({ w: Math.cos(deg * Math.PI / 360), x: 0, y: Math.sin(deg * Math.PI / 360), z: 0 });
+
+// Deterministic pseudo-random numbers so a failure reproduces.
+let seed = 12345;
+const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+const gauss = () => Math.sqrt(-2 * Math.log(rand() + 1e-12)) * Math.cos(2 * Math.PI * rand());
+
+// ---- yaw extraction matches the bridge convention ----
+check("yawDeg of a +30 degree yaw quaternion", Math.abs(D.yawDeg(yawQ(30)) - 30) < 1e-9);
+check("wrap180 folds 190 to -170", Math.abs(D.wrap180(190) + 170) < 1e-9);
+
+// ---- head log interpolation, including across the +-180 seam ----
+{
+  const h = new D.HeadLog(100);
+  h.push(0, yawQ(170)); h.push(100, yawQ(-170));
+  const mid = h.at(50);
+  check("interpolates across the seam the short way", Math.abs(D.wrap180(mid - 180)) < 1e-6, `${mid}`);
+  check("returns null outside the logged window", h.at(-1) === null && h.at(101) === null);
+}
+
+// ---- frame shift estimator on a synthetic textured image ----
+{
+  const w = 320, h = 200;
+  const texture = (x, y) => 128 + 60 * Math.sin(x * 0.37 + y * 0.11) + 50 * Math.sin(x * 0.091 - y * 0.23) + 30 * Math.sin((x + 2 * y) * 0.61);
+  const render = (offset) => {
+    const rgb = new Uint8Array(w * h * 3);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const v = Math.max(0, Math.min(255, texture(x - offset, y)));
+        const i = (y * w + x) * 3; rgb[i] = rgb[i + 1] = rgb[i + 2] = v;
+      }
+    return rgb;
+  };
+  for (const truth of [3, -5, 0, 2.5]) {
+    const fs = new D.FrameShift();
+    check(`first frame gives no shift (truth ${truth})`, fs.feed(render(0), w, h) === null);
+    const r = fs.feed(render(truth), w, h);
+    check(`recovers a content shift of ${truth} px`, Math.abs(r.shift - truth) < 0.35, `measured ${r.shift.toFixed(2)}, quality ${r.quality.toFixed(2)}`);
+  }
+  // A static overlay outside the band must not bias the answer.
+  const fs = new D.FrameShift();
+  const a = render(0), b = render(4);
+  for (const img of [a, b]) for (let y = 0; y < h; y++) for (let x = 0; x < 60; x++) { const i = (y * w + x) * 3; img[i] = img[i + 1] = img[i + 2] = 20; }
+  fs.feed(a, w, h);
+  const r = fs.feed(b, w, h);
+  check("a static overlay at the image edge does not pull the shift to zero", Math.abs(r.shift - 4) < 0.35, `measured ${r.shift.toFixed(2)}`);
+}
+
+// ---- analysis recovers a known delay, gain and jitter ----
+function simulate({ L, gain, arrivalJitterMs, pxNoise, fps }) {
+  const head = new D.HeadLog(50000);
+  const yawAt = (t) => 35 * Math.sin(2 * Math.PI * t / 4000) + 10 * Math.sin(2 * Math.PI * t / 1300);
+  for (let t = 0; t <= 60000; t += 1000 / 72) head.push(t, yawQ(yawAt(t)));
+  const frames = [];
+  let prevYaw = null, prevArrive = -Infinity, delaySum = 0;
+  for (let tr = 500; tr < 59000; tr += 1000 / fps) {
+    // Rendered with the pose at tr; arrives later, in order, as a real pipe does.
+    // Keeping arrivals in order pushes some later, so the true mean delay can
+    // exceed L; it is returned so tests compare against what was simulated.
+    const arrive = Math.max(prevArrive + 1, tr + L + arrivalJitterMs * gauss());
+    const y = yawAt(tr);
+    frames.push({ t: arrive, shift: prevYaw === null ? 0 : gain * D.wrap180(y - prevYaw) + pxNoise * gauss() });
+    delaySum += arrive - tr;
+    prevYaw = y; prevArrive = arrive;
+  }
+  return { head, frames, meanDelay: delaySum / frames.length };
+}
+{
+  const { head, frames } = simulate({ L: 60, gain: 3.5, arrivalJitterMs: 0, pxNoise: 0.3, fps: 30 });
+  const res = D.analyze(frames, head);
+  check("finds a 60 ms delay with clean timing", Math.abs(res.best.L - 60) <= 5, `best L ${res.best.L} ms`);
+  check("finds the 3.5 px/degree gain", Math.abs(res.best.gain - 3.5) < 0.15, `gain ${res.best.gain.toFixed(3)}`);
+  check("residual jitter is small with clean timing", res.best.rmsDeg < 0.15, `${res.best.rmsDeg.toFixed(3)} deg`);
+}
+{
+  const { head, frames, meanDelay } = simulate({ L: 60, gain: 3.5, arrivalJitterMs: 20, pxNoise: 0.3, fps: 30 });
+  const cleanSim = simulate({ L: 60, gain: 3.5, arrivalJitterMs: 0, pxNoise: 0.3, fps: 30 });
+  const clean = D.analyze(cleanSim.frames, cleanSim.head);
+  const res = D.analyze(frames, head);
+  check("still finds the mean delay when arrivals wobble by 20 ms", Math.abs(res.best.L - meanDelay) <= 10,
+        `best L ${res.best.L} ms, simulated mean delay ${meanDelay.toFixed(1)} ms`);
+  check("arrival wobble shows up as extra residual jitter", res.best.rmsDeg > clean.best.rmsDeg * 2,
+        `${res.best.rmsDeg.toFixed(3)} vs ${clean.best.rmsDeg.toFixed(3)} deg`);
+  const st = D.intervalStats(frames);
+  check("interval stats report the wobble", st.sd > 15, `sd ${st.sd.toFixed(1)} ms`);
+}
+
+// ---- step response recovers a known delay and easing ----
+{
+  // Camera = first-order lag (tau) of the head, delayed by T. For such a
+  // system: t10 = T + 0.105 tau, t50 = T + 0.693 tau, t90 = T + 2.303 tau.
+  const T = 40, tau = 100, gain = 3, size = 15, fps = 30;
+  const stepTimes = [];
+  for (let t = 1000; t < 30000; t += 1500) stepTimes.push(t);
+  const headAt = (t) => { let y = 0; for (let i = 0; i < stepTimes.length; i++) if (t >= stepTimes[i]) y = (i % 2 === 0) ? size : 0; return y; };
+  let cam = 0, last = 0;
+  const frames = [];
+  let prevCam = null;
+  for (let t = 0; t < 31000; t += 1) {                       // integrate at 1 ms
+    const target = headAt(t - T);
+    cam += (target - cam) * (1 - Math.exp(-1 / tau));
+    if (t - last >= 1000 / fps) {
+      last = t;
+      frames.push({ t, shift: prevCam === null ? 0 : gain * (cam - prevCam) });
+      prevCam = cam;
+    }
+  }
+  const r = D.stepResponse(frames, stepTimes, size);
+  const frameMs = 1000 / fps;
+  check("step response: t10 matches T + 0.105 tau", Math.abs(r.t10 - (T + 0.105 * tau)) <= frameMs, `${r.t10} ms vs ${(T + 0.105 * tau).toFixed(1)}`);
+  check("step response: t50 matches T + 0.693 tau", Math.abs(r.t50 - (T + 0.693 * tau)) <= frameMs, `${r.t50} ms vs ${(T + 0.693 * tau).toFixed(1)}`);
+  check("step response: t90 matches T + 2.303 tau", Math.abs(r.t90 - (T + 2.303 * tau)) <= frameMs, `${r.t90} ms vs ${(T + 2.303 * tau).toFixed(1)}`);
+  check("step response: recovers the gain", Math.abs(r.pxPerDeg - gain) < 0.05, `${r.pxPerDeg.toFixed(3)} px/deg`);
+  check("step response: no overshoot for a first-order lag", r.overshoot < 0.02, `${r.overshoot.toFixed(3)}`);
+}
+
+document.getElementById("summary").innerHTML = `<b class="${failures ? "fail" : "pass"}">${checks} checks, ${failures} failures</b>`;
+window.testResult = { checks, failures };
+})();
+</script>
+</body>
+</html>
